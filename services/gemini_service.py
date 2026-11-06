@@ -131,7 +131,7 @@ class GeminiDisasterEngine:
         if self.api_key:
             try:
                 from google import genai
-                self._client = genai.Client(api_key=self.api_key)
+                self._client = genai.Client(api_key=self.api_key, http_options={'timeout': 5000})
                 logger.info(f"CrisisBridge: Initialized google-genai Client with model {self.model_name}")
             except Exception as e:
                 logger.error(f"CrisisBridge: Error initializing google-genai client: {e}")

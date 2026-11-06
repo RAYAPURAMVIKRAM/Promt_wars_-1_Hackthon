@@ -4,10 +4,12 @@ CrisisBridge FastAPI Application.
 
 Production-ready, accessible, high-performance disaster response hub.
 Transforms messy, unstructured distress calls into verified, prioritized rescue tickets.
+Supports Supabase persistence with automatic, bulletproof demo/seed fallback.
 """
 
 import os
 import time
+import logging
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, status
@@ -29,9 +31,12 @@ from services.gemini_service import (
     UrgencyLevel,
     TicketStatus
 )
+from services.supabase_service import supabase_service
 
-# In-memory ticket storage (scalable to Redis/Cloud Spanner/Firestore)
-INCIDENT_DATABASE: List[EmergencyTicket] = []
+logger = logging.getLogger("crisisbridge.main")
+
+# In-memory ticket storage synchronized with supabase_service demo cache
+INCIDENT_DATABASE: List[EmergencyTicket] = supabase_service._memory_cache
 APP_START_TIME = time.time()
 
 
@@ -92,6 +97,9 @@ class SystemStatsResponse(BaseModel):
     resolved_tickets: int
     average_confidence_score: float
     gemini_ai_configured: bool
+    supabase_configured: bool = False
+    supabase_connected: bool = False
+    storage_mode: str = "in-memory-fallback"
 
 
 class HealthResponse(BaseModel):
@@ -101,57 +109,26 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
     gemini_api_configured: bool
     total_tickets_tracked: int
+    supabase_configured: bool = False
+    supabase_connected: bool = False
+    storage_mode: str = "in-memory-fallback"
 
 
 # Seed Initial Realistic Emergency Incidents for Live Demonstration
 def seed_initial_tickets():
-    if INCIDENT_DATABASE:
-        return
-    
-    samples = [
-        (
-            "Water levels rose 6 feet in 20 mins! Ground floor submerged, 4 elders and 2 infants trapped on terrace at 4th Cross, Rainbow Colony near Bellandur Lake, Bangalore. Battery dying!",
-            "Voice Transcript",
-            "Suresh Kumar",
-            "+91 98450 11234"
-        ),
-        (
-            "Dense chemical black smoke pouring from 3rd floor textiles godown at Industrial Area Phase 2, Peenya. 3 security guards trapped inside behind locked metal shutter!",
-            "Radio Call",
-            "Station Commander 14",
-            "Radio CH-4"
-        ),
-        (
-            "Building column sheared after earth slip. 5 construction workers trapped under collapsed scaffolding near Metro Pillar 218, Outer Ring Road. Two bleeding heavily, urgent trauma unit needed!",
-            "SMS SOS",
-            "Kavita R",
-            "+91 98860 55432"
-        )
-    ]
-    
-    for text, src, name, contact in samples:
-        t = disaster_engine._heuristic_triage(text)
-        v = disaster_engine._heuristic_verification(text, t)
-        ticket = EmergencyTicket(
-            ticket_id=f"CRB-{len(INCIDENT_DATABASE)+1:06d}-DEMO",
-            created_at="2026-09-11T09:15:00Z",
-            raw_text=text,
-            source=src,
-            reporter_name=name,
-            contact_info=contact,
-            status=TicketStatus.PENDING,
-            triage=t,
-            verification=v,
-            pipeline_latency_ms=142.5,
-            engine_mode="seeded-demonstration"
-        )
-        INCIDENT_DATABASE.append(ticket)
+    """Ensure baseline demonstration tickets exist in memory cache."""
+    if not supabase_service._memory_cache:
+        supabase_service._init_memory_cache()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Seed initial realistic tickets for immediate dashboard feedback
+    # Startup: Ensure baseline demo tickets and attempt Supabase connection
     seed_initial_tickets()
+    try:
+        await supabase_service.initialize()
+    except Exception as e:
+        logger.warning(f"CrisisBridge: Startup Supabase initialization notice: {e}")
     yield
     # Shutdown actions if needed
 
@@ -198,14 +175,18 @@ async def serve_dashboard():
 @app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
 @app.get("/api/health", response_model=HealthResponse, tags=["Monitoring"])
 async def health_check():
-    """Service health and Gemini AI integration readiness monitor."""
+    """Service health, Gemini AI and Supabase integration readiness monitor."""
+    tickets = await supabase_service.get_tickets()
     return HealthResponse(
         status="healthy",
         service="CrisisBridge Disaster Triage Hub",
         version="1.0.0",
         uptime_seconds=round(time.time() - APP_START_TIME, 2),
         gemini_api_configured=disaster_engine.is_configured,
-        total_tickets_tracked=len(INCIDENT_DATABASE)
+        total_tickets_tracked=len(tickets),
+        supabase_configured=supabase_service.is_configured,
+        supabase_connected=supabase_service.is_connected,
+        storage_mode="supabase" if supabase_service.is_connected else "in-memory-fallback"
     )
 
 
@@ -221,6 +202,7 @@ async def submit_distress_signal(signal: SignalRequest):
     Processes the message through the Two-Stage Google Gemini 2.5 Flash Pipeline:
     1. Agent 1: Extracts structured incident parameters (Urgency, Victims, Location, Resources).
     2. Agent 2: Cross-examines against hallucinations and assigns confidence score (0-100%).
+    Persists to Supabase with automatic in-memory fallback.
     """
     try:
         ticket = await disaster_engine.process_signal(
@@ -229,9 +211,8 @@ async def submit_distress_signal(signal: SignalRequest):
             reporter_name=signal.reporter_name,
             contact_info=signal.contact_info
         )
-        # Prepend to database for immediate top-of-feed display
-        INCIDENT_DATABASE.insert(0, ticket)
-        return ticket
+        saved_ticket = await supabase_service.save_ticket(ticket)
+        return saved_ticket
     except Exception as e:
         # Fallback guarantee: never drop an emergency signal
         raise HTTPException(
@@ -249,74 +230,51 @@ async def get_tickets(
 ):
     """
     List emergency tickets sorted by priority (CRITICAL -> HIGH -> MEDIUM -> LOW).
-    Supports multi-attribute operational filtering.
+    Supports multi-attribute operational filtering across Supabase or in-memory demo cache.
     """
-    tickets = list(INCIDENT_DATABASE)
-
-    if urgency:
-        tickets = [t for t in tickets if t.triage.urgency_level == urgency]
-
-    if incident_type:
-        tickets = [t for t in tickets if t.triage.incident_type == incident_type]
-
-    if status:
-        tickets = [t for t in tickets if t.status == status]
-
-    if search:
-        s = search.lower()
-        tickets = [
-            t for t in tickets
-            if s in t.triage.location.lower()
-            or s in t.raw_text.lower()
-            or s in t.triage.summary.lower()
-        ]
-
-    # Priority rank sorting: CRITICAL (0), HIGH (1), MEDIUM (2), LOW (3)
-    priority_order = {
-        UrgencyLevel.CRITICAL: 0,
-        UrgencyLevel.HIGH: 1,
-        UrgencyLevel.MEDIUM: 2,
-        UrgencyLevel.LOW: 3
-    }
-    tickets.sort(key=lambda x: priority_order.get(x.triage.urgency_level, 4))
-    return tickets
+    return await supabase_service.get_tickets(
+        urgency=urgency,
+        incident_type=incident_type,
+        status=status,
+        search=search
+    )
 
 
 @app.get("/api/tickets/{ticket_id}", response_model=EmergencyTicket, tags=["Responder Feed"])
 async def get_single_ticket(ticket_id: str):
     """Fetch complete ticket details by ID."""
-    for ticket in INCIDENT_DATABASE:
-        if ticket.ticket_id == ticket_id:
-            return ticket
+    ticket = await supabase_service.get_ticket_by_id(ticket_id)
+    if ticket:
+        return ticket
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Ticket {ticket_id} not found.")
 
 
 @app.patch("/api/tickets/{ticket_id}/status", response_model=EmergencyTicket, tags=["Responder Feed"])
 async def update_ticket_status(ticket_id: str, update: StatusUpdateRequest):
     """Allows field commanders to update dispatch status (e.g. PENDING -> DISPATCHED -> RESOLVED)."""
-    for ticket in INCIDENT_DATABASE:
-        if ticket.ticket_id == ticket_id:
-            ticket.status = update.status
-            return ticket
+    ticket = await supabase_service.update_ticket_status(ticket_id, update.status, update.notes)
+    if ticket:
+        return ticket
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Ticket {ticket_id} not found.")
 
 
 @app.get("/api/stats", response_model=SystemStatsResponse, tags=["Monitoring"])
 async def get_system_stats():
     """Aggregated operational metrics for emergency command dashboard."""
-    total = len(INCIDENT_DATABASE)
-    critical = sum(1 for t in INCIDENT_DATABASE if t.triage.urgency_level == UrgencyLevel.CRITICAL)
-    high = sum(1 for t in INCIDENT_DATABASE if t.triage.urgency_level == UrgencyLevel.HIGH)
-    medium = sum(1 for t in INCIDENT_DATABASE if t.triage.urgency_level == UrgencyLevel.MEDIUM)
-    low = sum(1 for t in INCIDENT_DATABASE if t.triage.urgency_level == UrgencyLevel.LOW)
+    all_tickets = await supabase_service.get_tickets()
+    total = len(all_tickets)
+    critical = sum(1 for t in all_tickets if t.triage.urgency_level == UrgencyLevel.CRITICAL)
+    high = sum(1 for t in all_tickets if t.triage.urgency_level == UrgencyLevel.HIGH)
+    medium = sum(1 for t in all_tickets if t.triage.urgency_level == UrgencyLevel.MEDIUM)
+    low = sum(1 for t in all_tickets if t.triage.urgency_level == UrgencyLevel.LOW)
     
-    total_victims = sum(t.triage.victims_trapped for t in INCIDENT_DATABASE)
-    dispatched = sum(1 for t in INCIDENT_DATABASE if t.status in [TicketStatus.DISPATCHED, TicketStatus.EN_ROUTE])
-    pending = sum(1 for t in INCIDENT_DATABASE if t.status == TicketStatus.PENDING)
-    resolved = sum(1 for t in INCIDENT_DATABASE if t.status == TicketStatus.RESOLVED)
+    total_victims = sum(t.triage.victims_trapped for t in all_tickets)
+    dispatched = sum(1 for t in all_tickets if t.status in [TicketStatus.DISPATCHED, TicketStatus.EN_ROUTE])
+    pending = sum(1 for t in all_tickets if t.status == TicketStatus.PENDING)
+    resolved = sum(1 for t in all_tickets if t.status == TicketStatus.RESOLVED)
 
     avg_conf = (
-        round(sum(t.verification.confidence_score for t in INCIDENT_DATABASE) / total, 1)
+        round(sum(t.verification.confidence_score for t in all_tickets) / total, 1)
         if total > 0 else 0.0
     )
 
@@ -331,7 +289,10 @@ async def get_system_stats():
         pending_tickets=pending,
         resolved_tickets=resolved,
         average_confidence_score=avg_conf,
-        gemini_ai_configured=disaster_engine.is_configured
+        gemini_ai_configured=disaster_engine.is_configured,
+        supabase_configured=supabase_service.is_configured,
+        supabase_connected=supabase_service.is_connected,
+        storage_mode="supabase" if supabase_service.is_connected else "in-memory-fallback"
     )
 
 
